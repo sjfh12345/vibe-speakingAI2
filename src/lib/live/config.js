@@ -9,12 +9,7 @@ export const LIVE_API_VERSION = 'v1beta';
 export const INPUT_SAMPLE_RATE = 16000;
 export const OUTPUT_SAMPLE_RATE = 24000;
 
-export const SYSTEM_PROMPT = `You are a friendly English conversation tutor talking with a Korean learner (intermediate level).
-- Speak only in natural, spoken English. Keep each reply short: 1-2 sentences, then hand the turn back with a question.
-- Use simple vocabulary and a moderate speaking pace.
-- If the learner makes a grammar or word-choice mistake, briefly recast the correct form in your reply (e.g. "Oh, you went to the park yesterday? Nice!") without interrupting the flow or lecturing.
-- If the learner speaks Korean or seems stuck, gently help with a short English hint, then continue.
-- Start by greeting the learner and asking a simple question about their day.`;
+// 튜터 시스템 프롬프트는 사용자 설정으로 만든다 → tutor-prompt.js 의 buildSystemPrompt()
 
 const REALTIME_INPUT_CONFIG = {
 	automaticActivityDetection: {
@@ -32,22 +27,28 @@ const REALTIME_INPUT_CONFIG = {
 /**
  * 토큰 발급 시 서버에서 고정하는 세션 설정 (@google/genai LiveConnectConfig 포맷).
  * 토큰에 잠긴 설정이 우선 적용되므로 튜터 설정의 실제 기준은 이것이다.
+ * @param {string} systemPrompt
  */
-export const LIVE_CONNECT_CONFIG = {
-	responseModalities: ['AUDIO'],
-	systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
-	realtimeInputConfig: REALTIME_INPUT_CONFIG,
-	inputAudioTranscription: {},
-	outputAudioTranscription: {}
-};
+export function buildLiveConnectConfig(systemPrompt) {
+	return {
+		responseModalities: ['AUDIO'],
+		systemInstruction: { parts: [{ text: systemPrompt }] },
+		realtimeInputConfig: REALTIME_INPUT_CONFIG,
+		inputAudioTranscription: {},
+		outputAudioTranscription: {}
+	};
+}
 
-/** WebSocket setup 메시지 (wire 포맷). 토큰에 잠긴 설정과 같은 내용을 보낸다 */
-export function buildSetupMessage() {
+/**
+ * WebSocket setup 메시지 (wire 포맷). 토큰에 잠긴 설정과 같은 내용을 보낸다
+ * @param {string} systemPrompt 토큰 발급 시 서버가 돌려준 프롬프트
+ */
+export function buildSetupMessage(systemPrompt) {
 	return {
 		setup: {
 			model: `models/${LIVE_MODEL}`,
 			generationConfig: { responseModalities: ['AUDIO'] },
-			systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
+			systemInstruction: { parts: [{ text: systemPrompt }] },
 			realtimeInputConfig: REALTIME_INPUT_CONFIG,
 			inputAudioTranscription: {},
 			outputAudioTranscription: {}

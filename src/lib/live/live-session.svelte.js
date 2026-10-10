@@ -4,6 +4,7 @@ import {
   INPUT_SAMPLE_RATE,
   OUTPUT_SAMPLE_RATE,
 } from "./config.js";
+import { HistoryRecorder } from "./history-recorder.svelte.js";
 
 // static/worklets 의 파일은 번들링 없이 그대로 제공된다
 const captureWorkletUrl = "/worklets/capture.js";
@@ -47,6 +48,14 @@ function clockTime() {
 }
 
 export class LiveSession {
+  /**
+   * @param {{ canSave?: () => boolean }} [options]
+   *   canSave: 대화를 회화 기록으로 저장할지 (로그인 여부)
+   */
+  constructor({ canSave = () => false } = {}) {
+    this.canSave = canSave;
+  }
+
   status = $state(
     /** @type {'idle' | 'connecting' | 'live' | 'error'} */ ("idle"),
   );
@@ -58,6 +67,8 @@ export class LiveSession {
   /** 사용자가 말을 멈춘 뒤 AI 첫 음성이 도착하기까지 (ms) */
   lastLatency = $state(/** @type {number | null} */ (null));
   messages = $state(/** @type {Message[]} */ ([]));
+  /** 현재 대화의 회화 기록 저장 담당 (연결마다 새로 만든다) */
+  history = $state(new HistoryRecorder());
 
   /** 실제 리소스 상태 (UI 표시값이 아니라 브라우저 객체에서 읽어 온 값) */
   link = $state({
@@ -98,6 +109,12 @@ export class LiveSession {
   nextLogId = 1;
   /** 연결 시도마다 증가. 진행 중이던 connect()가 취소되었는지 판별한다 */
   gen = 0;
+  /** 이번 대화의 튜터 설정 @type {import('./tutor-prompt.js').TutorSettings | undefined} */
+  settings;
+  /** 토큰 발급 시 서버가 만들어 돌려준 시스템 프롬프트 (setup 메시지에 그대로 사용) */
+  systemPrompt = "";
+  /** 이번 대화에 사용한 저장 프롬프트 id @type {string | null} */
+  customPromptId = null;
   closeRequestedAt = 0;
   /** @type {ReturnType<typeof setTimeout> | undefined} */ closeTimer;
 
@@ -107,13 +124,22 @@ export class LiveSession {
     if (this.log.length > 200) this.log.splice(0, this.log.length - 200);
   }
 
-  async connect() {
+  /**
+   * @param {import('./tutor-prompt.js').TutorSettings} [settings] 이번 대화의 튜터 설정
+   * @param {string | null} [customPromptId] 수정 없이 사용한 저장 프롬프트 id (회화 기록에 연결)
+   */
+  async connect(settings, customPromptId = null) {
     if (this.status === "connecting" || this.status === "live") return;
     const gen = ++this.gen;
+    // 대화 도중 설정 화면이 바뀌어도 이번 세션에는 영향이 없도록 복사해 둔다
+    this.settings = settings ? { ...settings } : undefined;
+    this.customPromptId = customPromptId;
     this.status = "connecting";
     this.error = "";
     this.notice = "";
     this.messages = [];
+    // 이전 대화의 기록기는 남은 저장을 마저 끝내도록 두고, 새 대화용으로 교체한다
+    this.history = new HistoryRecorder();
     this.lastLatency = null;
     this.log = [];
     Object.assign(this.link, {
@@ -207,12 +233,17 @@ export class LiveSession {
   }
 
   async fetchToken() {
-    const res = await fetch("/api/live-token", { method: "POST" });
+    const res = await fetch("/api/live-token", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ settings: this.settings }),
+    });
     if (!res.ok) {
       const body = await res.json().catch(() => null);
       throw new Error(body?.message ?? `토큰 발급 실패 (${res.status})`);
     }
-    const { token } = await res.json();
+    const { token, systemPrompt } = await res.json();
+    this.systemPrompt = systemPrompt;
     this.addLog("ok", "임시 토큰 발급됨");
     return /** @type {string} */ (token);
   }
@@ -257,7 +288,7 @@ export class LiveSession {
     ws.onopen = () => {
       this.syncWsState(ws);
       this.addLog("ok", "WebSocket 연결됨 → setup 전송");
-      ws.send(JSON.stringify(buildSetupMessage()));
+      ws.send(JSON.stringify(buildSetupMessage(this.systemPrompt)));
     };
     ws.onmessage = (e) => {
       // 종료 요청 후 도착한 메시지는 무시 (끊긴 세션이 다시 live로 바뀌는 것 방지)
@@ -312,7 +343,7 @@ export class LiveSession {
       );
       if (e.code === 1000 && wasLive) {
         this.notice = "세션이 종료되었습니다.";
-        this.teardown("idle");
+        this.teardown("idle", "server", `서버가 세션을 종료했습니다${reason}`);
       } else {
         this.fail(`연결이 끊겼습니다${reason}`);
       }
@@ -349,6 +380,7 @@ export class LiveSession {
     if (msg.setupComplete) {
       this.ready = true;
       this.status = "live";
+      this.history.start(this.canSave(), this.settings, this.customPromptId);
       this.addLog("ok", "세션 준비 완료 (setupComplete) — 대화 가능");
       // 모델이 먼저 인사하도록 첫 턴을 연다
       this.ws?.send(JSON.stringify({ realtimeInput: { text: "Hi!" } }));
@@ -357,6 +389,7 @@ export class LiveSession {
 
     if (msg.goAway) {
       this.notice = `서버가 곧 세션을 종료합니다 (남은 시간: ${msg.goAway.timeLeft ?? "알 수 없음"}).`;
+      this.history.system(this.notice);
       this.addLog(
         "warn",
         `goAway 수신 (남은 시간: ${msg.goAway.timeLeft ?? "?"})`,
@@ -395,6 +428,8 @@ export class LiveSession {
     if (sc.turnComplete) {
       for (const m of this.messages) m.done = true;
       this.awaitingReply = false;
+      // 턴이 끝날 때마다 이어서 저장 → 브라우저가 갑자기 꺼져도 여기까지는 남는다
+      this.history.flush(this.messages);
     }
   }
 
@@ -435,24 +470,37 @@ export class LiveSession {
     );
   }
 
-  /** 대화 종료 또는 연결 중 취소 */
-  disconnect() {
+  /**
+   * 대화 종료 또는 연결 중 취소
+   * @param {'user' | 'leave'} [reason] leave = 페이지를 떠나면서 종료
+   */
+  disconnect(reason = "user") {
     if (this.status === "idle" && !this.ws) return;
     this.addLog(
       "info",
       this.status === "connecting" ? "연결 취소 요청" : "대화 종료 요청",
     );
-    this.teardown("idle");
+    this.teardown(
+      "idle",
+      reason,
+      reason === "leave"
+        ? "페이지를 떠나 대화가 종료되었습니다"
+        : "사용자가 대화를 종료했습니다",
+    );
   }
 
   /** @param {string} message */
   fail(message) {
     this.error = message;
-    this.teardown("error");
+    this.teardown("error", "error", `오류로 대화가 끊겼습니다: ${message}`);
   }
 
-  /** @param {'idle' | 'error'} status */
-  teardown(status) {
+  /**
+   * @param {'idle' | 'error'} status
+   * @param {import('./history-recorder.svelte.js').EndReason} reason 회화 기록에 남길 종료 사유
+   * @param {string} note 회화 기록에 남길 종료 안내 (시스템 메시지)
+   */
+  teardown(status, reason, note) {
     this.gen++; // 진행 중인 connect()가 있다면 무효화
     const ws = this.ws;
     this.ws = null;
@@ -503,6 +551,8 @@ export class LiveSession {
     this.muted = false;
     for (const m of this.messages) m.done = true;
     this.status = status;
+    // 대화가 시작되지 않았던 경우(연결 중 취소 등)에는 아무것도 하지 않는다
+    this.history.end(this.messages, reason, note);
   }
 
   /** @param {unknown} e */

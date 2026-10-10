@@ -1,9 +1,63 @@
 <script>
 	import { tick } from 'svelte';
+	import { page } from '$app/state';
 	import { LiveSession } from '#lib/live/live-session.svelte.js';
+	import {
+		DEFAULT_TUTOR_SETTINGS,
+		normalizeTutorSettings,
+		normalizeCustomPrompt
+	} from '#lib/live/tutor-prompt.js';
 	import LiveDiagnostics from './LiveDiagnostics.svelte';
+	import TutorSettings from './TutorSettings.svelte';
 
-	const session = new LiveSession();
+	/**
+	 * @type {{
+	 *   customPrompts?: { id: string, title: string, content: string }[],
+	 *   customPromptsError?: string | null
+	 * }}
+	 */
+	let { customPrompts = [], customPromptsError = null } = $props();
+
+	const SETTINGS_KEY = 'tutor-settings';
+
+	// 로그인한 경우에만 대화가 끝날 때 기록을 저장한다
+	const session = new LiveSession({ canSave: () => Boolean(page.data.user) });
+
+	let settings = $state({ ...DEFAULT_TUTOR_SETTINGS });
+	/** 불러온 저장 프롬프트 id */
+	let selectedPromptId = $state(/** @type {string | null} */ (null));
+	let settingsLoaded = false;
+
+	// 저장 프롬프트를 수정 없이 그대로 쓰는 경우에만 회화 기록에 연결한다
+	const usedPromptId = $derived.by(() => {
+		const p = customPrompts.find((c) => c.id === selectedPromptId);
+		return p && normalizeCustomPrompt(p.content) === normalizeCustomPrompt(settings.customPrompt) ? p.id : null;
+	});
+
+	// 마지막으로 쓴 튜터 설정을 이 브라우저에 기억한다 (서버 렌더링과 어긋나지 않도록 마운트 후 읽음)
+	$effect(() => {
+		try {
+			const saved = localStorage.getItem(SETTINGS_KEY);
+			if (saved) {
+				const value = JSON.parse(saved);
+				// 이전 형식(설정만 저장)도 읽는다
+				settings = normalizeTutorSettings(value.settings ?? value);
+				selectedPromptId = typeof value.selectedPromptId === 'string' ? value.selectedPromptId : null;
+			}
+		} catch {
+			// 저장소를 쓸 수 없거나 값이 깨졌으면 기본값 사용
+		}
+		settingsLoaded = true;
+	});
+	$effect(() => {
+		const json = JSON.stringify({ settings, selectedPromptId });
+		if (!settingsLoaded) return;
+		try {
+			localStorage.setItem(SETTINGS_KEY, json);
+		} catch {
+			// 사생활 보호 모드 등에서는 기억하지 않는다
+		}
+	});
 
 	/** @type {HTMLDivElement | undefined} */
 	let scroller = $state();
@@ -15,8 +69,10 @@
 		tick().then(() => scroller?.scrollTo({ top: scroller.scrollHeight, behavior: 'smooth' }));
 	});
 
-	// 페이지를 떠나면 연결 정리 ($effect는 브라우저에서만 실행)
-	$effect(() => () => session.disconnect());
+	const history = $derived(session.history);
+
+	// 다른 페이지로 이동하면 연결 정리 ($effect는 브라우저에서만 실행)
+	$effect(() => () => session.disconnect('leave'));
 
 	const statusLabel = $derived(
 		session.status === 'connecting'
@@ -32,6 +88,9 @@
 					: '대기'
 	);
 </script>
+
+<!-- 탭을 닫거나 새로고침할 때는 $effect 정리가 실행되지 않으므로 여기서 대화를 마감·저장한다 -->
+<svelte:window onpagehide={() => session.disconnect('leave')} />
 
 <section class="mx-auto w-full max-w-2xl space-y-4">
 	<div class="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
@@ -103,7 +162,7 @@
 					</button>
 				{:else}
 					<button
-						onclick={() => session.connect()}
+						onclick={() => session.connect(normalizeTutorSettings(settings), usedPromptId)}
 						class="rounded-full bg-emerald-500 px-8 py-3 font-semibold text-white shadow transition hover:bg-emerald-600"
 					>
 						대화 시작
@@ -122,7 +181,39 @@
 		{#if session.notice}
 			<p class="mt-4 rounded-lg bg-amber-50 px-4 py-2 text-sm text-amber-800">{session.notice}</p>
 		{/if}
+
+		{#if history.state === 'recording'}
+			<p class="mt-4 flex items-center gap-2 rounded-lg bg-slate-50 px-4 py-2 text-sm text-slate-600">
+				<span class="h-2 w-2 animate-pulse rounded-full bg-red-500"></span>
+				이 대화는 회화 기록에 저장되고 있습니다.
+			</p>
+		{:else if history.state === 'saving'}
+			<p class="mt-4 rounded-lg bg-slate-50 px-4 py-2 text-sm text-slate-600">회화 기록을 저장하는 중…</p>
+		{:else if history.state === 'saved'}
+			<p class="mt-4 rounded-lg bg-emerald-50 px-4 py-2 text-sm text-emerald-700">
+				회화 기록을 저장했습니다.
+				<a href="/history/{history.id}" class="ml-1 font-medium underline">방금 대화 보기</a>
+			</p>
+		{:else if history.state === 'skipped'}
+			<p class="mt-4 rounded-lg bg-slate-50 px-4 py-2 text-sm text-slate-600">
+				<a href="/login" class="font-medium underline">로그인</a>하면 회화 기록이 자동으로 저장됩니다.
+			</p>
+		{:else if history.state === 'error'}
+			<p class="mt-4 rounded-lg bg-red-50 px-4 py-2 text-sm break-words text-red-700">
+				회화 기록 저장 실패: {history.error}
+				{#if history.id}<a href="/history/{history.id}" class="ml-1 font-medium underline">저장된 부분 보기</a>{/if}
+			</p>
+		{/if}
 	</div>
+
+	<TutorSettings
+		bind:settings
+		bind:selectedPromptId
+		disabled={session.status === 'connecting' || session.status === 'live'}
+		loggedIn={Boolean(page.data.user)}
+		{customPrompts}
+		{customPromptsError}
+	/>
 
 	<LiveDiagnostics {session} />
 
