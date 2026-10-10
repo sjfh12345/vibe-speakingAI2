@@ -396,6 +396,9 @@ export class LiveSession {
       );
     }
 
+    // 사용량은 serverContent 와 별개로 메시지 최상위에 온다
+    if (msg.usageMetadata) this.reportUsage(msg.usageMetadata);
+
     const sc = msg.serverContent;
     if (!sc) return;
 
@@ -431,6 +434,28 @@ export class LiveSession {
       // 턴이 끝날 때마다 이어서 저장 → 브라우저가 갑자기 꺼져도 여기까지는 남는다
       this.history.flush(this.messages);
     }
+  }
+
+  /**
+   * Live API 사용량 1건을 서버에 기록한다 (로그인한 경우만). 관리자 페이지의 사용량 집계에 쓰인다
+   * @param {unknown} usage
+   */
+  reportUsage(usage) {
+    if (!this.canSave()) return;
+    fetch("/api/usage", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      // 대화 종료 직후 페이지를 떠나도 전송되도록
+      keepalive: true,
+      body: JSON.stringify({ usage, conversationId: this.history.id }),
+    })
+      .then(async (res) => {
+        if (!res.ok) {
+          const body = await res.json().catch(() => null);
+          this.addLog("warn", `사용량 기록 실패: ${body?.message ?? res.status}`);
+        }
+      })
+      .catch((e) => this.addLog("warn", `사용량 기록 실패: ${e.message}`));
   }
 
   /** @param {'user' | 'ai'} role @param {string} text */
